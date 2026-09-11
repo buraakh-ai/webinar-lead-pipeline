@@ -26,19 +26,26 @@ BEGIN
 
         -- Row insert time, in UTC. Not one of the 5 business columns --
         -- kept for auditing/troubleshooting which load a row came from.
-        loaded_at   DATETIME2(0)   NOT NULL DEFAULT SYSUTCDATETIME()
+        loaded_at       DATETIME2(0)   NOT NULL DEFAULT SYSUTCDATETIME(),
+
+        -- SCD-2 history columns: every time the lead changes, the prior
+        -- current row is closed and a new row with a higher version is
+        -- inserted. This lets the pipeline stay idempotent for unchanged
+        -- input, while preserving historical versions for changed records.
+        effective_start DATETIME2(0)   NULL,
+        effective_end   DATETIME2(0)   NULL,
+        is_current      INT            NULL,
+        version         INT            NULL
     );
 END
 GO
 
--- Optional: uncomment once the loader does an upsert (e.g. T-SQL MERGE)
--- instead of a plain INSERT. Without an upsert, a unique constraint here
--- would make merge_and_load.py fail on its second run against the same
--- data, since every run currently just inserts. Filtered (WHERE email IS
--- NOT NULL) because a plain unique index only allows one NULL row, but
--- leads with no email at all (Bitrix rows with just a phone) are valid and
--- there can be more than one.
+-- Optional indexes / constraints for downstream analytics.
+-- The Python loader currently performs SCD-2 versioning via MERGE/update
+-- statements, so it doesn't require a unique constraint to make reruns safe.
+-- These are included here for convenience if you want to query the current
+-- record more efficiently.
 --
--- CREATE UNIQUE INDEX UX_webinar_leads_email
---     ON dbo.webinar_leads (email)
---     WHERE email IS NOT NULL;
+-- CREATE NONCLUSTERED INDEX IX_webinar_leads_current
+--     ON dbo.webinar_leads (is_current, email)
+--     WHERE is_current = 1;

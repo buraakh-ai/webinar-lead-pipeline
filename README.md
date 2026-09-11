@@ -16,7 +16,8 @@ Each export has far more columns than needed (Bitrix's real export is
 once within Bitrix alone (e.g. a call logged twice a minute apart). This
 script pulls just the 5 fields that matter (first name, last name, email,
 phone, comment), merges the two sources, collapses duplicates, and loads
-the result into a SQL Server table.
+the result into a destination table that now supports SCD-2-style history
+tracking.
 
 Today the two sources are files (dropped into `sample_data/`); AWS SQL
 Server credentials weren't available yet at the time this was built, so
@@ -65,18 +66,27 @@ like a header.
 See [schema.sql](schema.sql) for the full DDL and reasoning (e.g. why
 `comment` is `NVARCHAR(MAX)` and not a short `VARCHAR`). Summary:
 
-| column       | type            | notes                                  |
-|--------------|-----------------|-----------------------------------------|
-| `id`         | `INT IDENTITY`  | surrogate key, not one of the 5 fields |
-| `first_name` | `NVARCHAR(100)` |                                         |
-| `last_name`  | `NVARCHAR(100)` |                                         |
-| `email`      | `NVARCHAR(255)` |                                         |
-| `phone`      | `NVARCHAR(30)`  | digits only, no formatting             |
-| `comment`    | `NVARCHAR(MAX)` | full free-text note(s)                 |
-| `loaded_at`  | `DATETIME2`     | audit timestamp, not one of the 5      |
+| column           | type            | notes                                                    |
+|------------------|-----------------|-----------------------------------------------------------|
+| `id`             | `INT IDENTITY`  | surrogate key, not one of the 5 fields                   |
+| `first_name`     | `NVARCHAR(100)` |                                                           |
+| `last_name`      | `NVARCHAR(100)` |                                                           |
+| `email`          | `NVARCHAR(255)` |                                                           |
+| `phone`          | `NVARCHAR(30)`  | digits only, no formatting                               |
+| `comment`        | `NVARCHAR(MAX)` | full free-text note(s)                                   |
+| `loaded_at`      | `DATETIME2`     | audit timestamp, not one of the 5                        |
+| `effective_start`| `DATETIME2`     | when this version became current                        |
+| `effective_end`  | `DATETIME2`     | when this version stopped being current                  |
+| `is_current`     | `INT`           | `1` for the active version, `0` for historical versions  |
+| `version`        | `INT`           | monotonically increasing version number for a lead       |
 
 `merge_and_load.py` creates this table automatically on first run if it
 doesn't exist yet (matching `schema.sql`).
+
+In the current first phase, the loader keeps the destination idempotent for
+unchanged input and creates a new version when the lead's data changes.
+This is an SCD-2-style history model, but it is intentionally lightweight
+and meant to evolve as the project grows.
 
 ## Running it
 
@@ -101,10 +111,10 @@ python merge_and_load.py --target sqlserver
 - **Not tested against real AWS SQL Server** -- no credentials were
   available yet when this was built. `--target sqlserver` is wired up but
   unverified against a live instance (network access, ODBC driver, auth).
-- **Not idempotent** -- every run does a plain `INSERT`. Running it twice
-  against the same destination table will create duplicate rows. Needs an
-  upsert (e.g. a SQL Server `MERGE` keyed on email) before this runs on a
-  recurring schedule.
+- **This is only the first phase of SCD-2** -- the current loader keeps
+  history by versioning rows, but it does not yet add a full business-key
+  model, row-level provenance beyond `loaded_at`, or a more formal
+  historical query layer.
 - **No API integration yet** -- still reads local files, not the Zoom/
   Bitrix24 APIs.
 - **No scheduling/orchestration** -- nothing runs this automatically yet.

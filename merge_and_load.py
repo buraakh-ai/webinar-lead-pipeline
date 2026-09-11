@@ -36,6 +36,7 @@ import argparse
 import csv
 import os
 import re
+from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
 
@@ -50,6 +51,7 @@ from sqlalchemy import (
     UnicodeText,
     create_engine,
     func,
+    text,
 )
 from sqlalchemy.engine import Engine
 
@@ -358,10 +360,12 @@ def get_engine(target: str) -> Engine:
     return create_engine(f"sqlite:///{db_path}")
 
 
-def push_to_sql_server(df: pd.DataFrame, engine: Engine, table_name: str = DEST_TABLE) -> None:
-    """Creates the destination table if it doesn't exist yet (matching
-    schema.sql -- see that file if you'd rather run the DDL by hand / add
-    the optional unique index) and inserts the merged leads into it."""
+def _ensure_scd2_columns(engine: Engine, table_name: str) -> None:
+    """Adds the SCD-2 monitoring columns to the destination table.
+
+    Existing rows are backfilled as current version 1 so a later re-run can
+    close the prior version and insert a new one only when the data changed.
+    """
     metadata = MetaData()
     table = Table(
         table_name,
@@ -371,17 +375,230 @@ def push_to_sql_server(df: pd.DataFrame, engine: Engine, table_name: str = DEST_
         Column("last_name", Unicode(100)),
         Column("email", Unicode(255)),
         Column("phone", Unicode(30)),
-        # Unbounded text, not a short VARCHAR: Bitrix "Comment" values are
-        # full free-text notes, and merged leads concatenate multiple
-        # sources' comments together -- see schema.sql for the full reasoning.
         Column("comment", UnicodeText),
         Column("loaded_at", DateTime, nullable=False, server_default=func.now()),
+        Column("effective_start", DateTime),
+        Column("effective_end", DateTime),
+        Column("is_current", Integer),
+        Column("version", Integer),
+    )
+    table.create(bind=engine, checkfirst=True)
+
+    if engine.dialect.name == "sqlite":
+        with engine.begin() as conn:
+            existing_columns = {
+                row[1]
+                for row in conn.execute(text(f"PRAGMA table_info({table_name})")).fetchall()
+            }
+
+            for column_name, column_sql in (
+                ("effective_start", "DATETIME"),
+                ("effective_end", "DATETIME"),
+                ("is_current", "INTEGER"),
+                ("version", "INTEGER"),
+            ):
+                if column_name not in existing_columns:
+                    conn.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_sql}"))
+
+            conn.execute(
+                text(
+                    f"""
+                    UPDATE {table_name}
+                    SET
+                        effective_start = COALESCE(effective_start, loaded_at),
+                        effective_end = NULL,
+                        is_current = COALESCE(is_current, 1),
+                        version = COALESCE(version, 1)
+                    WHERE effective_start IS NULL OR is_current IS NULL OR version IS NULL
+                    """
+                )
+            )
+        return
+
+    with engine.begin() as conn:
+        existing_columns = {
+            row[0]
+            for row in conn.execute(
+                text(
+                    f"""
+                    SELECT c.name
+                    FROM sys.columns c
+                    INNER JOIN sys.tables t ON c.object_id = t.object_id
+                    WHERE t.name = '{table_name}'
+                    """
+                )
+            ).fetchall()
+        }
+
+        for column_name, column_sql in (
+            ("effective_start", "DATETIME2(0) NULL"),
+            ("effective_end", "DATETIME2(0) NULL"),
+            ("is_current", "INT NULL"),
+            ("version", "INT NULL"),
+        ):
+            if column_name not in existing_columns:
+                conn.execute(
+                    text(
+                        f"ALTER TABLE dbo.{table_name} ADD {column_name} {column_sql}"
+                    )
+                )
+
+        conn.execute(
+            text(
+                f"""
+                UPDATE dbo.{table_name}
+                SET
+                    effective_start = COALESCE(effective_start, loaded_at),
+                    effective_end = NULL,
+                    is_current = COALESCE(is_current, 1),
+                    version = COALESCE(version, 1)
+                WHERE effective_start IS NULL OR is_current IS NULL OR version IS NULL
+                """
+            )
+        )
+
+
+def _row_signature(row: dict[str, object]) -> dict[str, object]:
+    return {
+        "first_name": None if pd.isna(row.get("first_name")) else str(row["first_name"]).strip(),
+        "last_name": None if pd.isna(row.get("last_name")) else str(row["last_name"]).strip(),
+        "email": None if pd.isna(row.get("email")) else str(row["email"]).strip().lower(),
+        "phone": None if pd.isna(row.get("phone")) else str(row["phone"]).strip(),
+        "comment": None if pd.isna(row.get("comment")) else str(row["comment"]).strip(),
+    }
+
+
+def _current_match(existing_rows: pd.DataFrame, row: dict[str, object]) -> pd.Series | None:
+    if not isinstance(existing_rows, pd.DataFrame) or existing_rows.empty:
+        return None
+
+    signature = _row_signature(row)
+
+    if signature["email"]:
+        matches = existing_rows[
+            (existing_rows["email"].fillna("").str.lower() == signature["email"])
+            & (existing_rows["is_current"].fillna(1) == 1)
+        ]
+    else:
+        matches = existing_rows[
+            (existing_rows["phone"].fillna("") == (signature["phone"] or ""))
+            & (existing_rows["is_current"].fillna(1) == 1)
+        ]
+
+    if matches.empty:
+        return None
+
+    return matches.iloc[0]
+
+
+def _rows_equal(current_row: pd.Series, incoming_row: dict[str, object]) -> bool:
+    incoming = _row_signature(incoming_row)
+    for field in ("first_name", "last_name", "email", "phone", "comment"):
+        current_value = current_row.get(field)
+        if pd.isna(current_value):
+            current_value = None
+        else:
+            current_value = str(current_value).strip()
+            if field == "email":
+                current_value = current_value.lower()
+        if current_value != incoming[field]:
+            return False
+    return True
+
+
+def push_to_sql_server(df: pd.DataFrame, engine: Engine, table_name: str = DEST_TABLE) -> None:
+    """Creates the destination table if it doesn't exist yet and stores rows
+    using SCD-2 semantics. Existing rows are versioned and updated only when
+    a later load changes the lead's data.
+    """
+    metadata = MetaData()
+    table = Table(
+        table_name,
+        metadata,
+        Column("id", Integer, primary_key=True, autoincrement=True),
+        Column("first_name", Unicode(100)),
+        Column("last_name", Unicode(100)),
+        Column("email", Unicode(255)),
+        Column("phone", Unicode(30)),
+        Column("comment", UnicodeText),
+        Column("loaded_at", DateTime, nullable=False, server_default=func.now()),
+        Column("effective_start", DateTime),
+        Column("effective_end", DateTime),
+        Column("is_current", Integer),
+        Column("version", Integer),
     )
     metadata.create_all(engine)
+    _ensure_scd2_columns(engine, table_name)
+
+    table_ref = f"dbo.{table_name}" if engine.dialect.name == "mssql" else table_name
+    existing_rows = pd.read_sql(
+        f"SELECT * FROM {table_ref} WHERE is_current = 1 OR is_current IS NULL",
+        engine,
+    )
 
     payload = df[["first_name", "last_name", "email", "phone", "comment"]].to_dict(orient="records")
+    now = datetime.now(timezone.utc)
+
+    updates: list[tuple[int, datetime]] = []
+    inserts: list[dict[str, object]] = []
+
+    for row in payload:
+        row_copy = dict(row)
+        existing_match = _current_match(existing_rows, row_copy)
+
+        if existing_match is None:
+            inserts.append(
+                {
+                    "first_name": row_copy.get("first_name"),
+                    "last_name": row_copy.get("last_name"),
+                    "email": row_copy.get("email"),
+                    "phone": row_copy.get("phone"),
+                    "comment": row_copy.get("comment"),
+                    "loaded_at": now,
+                    "effective_start": now,
+                    "effective_end": None,
+                    "is_current": 1,
+                    "version": 1,
+                }
+            )
+            continue
+
+        if _rows_equal(existing_match, row_copy):
+            continue
+
+        updates.append((int(existing_match["id"]), now))
+        version = int(existing_match["version"] or 1) + 1
+        inserts.append(
+            {
+                "first_name": row_copy.get("first_name"),
+                "last_name": row_copy.get("last_name"),
+                "email": row_copy.get("email"),
+                "phone": row_copy.get("phone"),
+                "comment": row_copy.get("comment"),
+                "loaded_at": now,
+                "effective_start": now,
+                "effective_end": None,
+                "is_current": 1,
+                "version": version,
+            }
+        )
+
     with engine.begin() as conn:
-        conn.execute(table.insert(), payload)
+        for row_id, effective_end in updates:
+            conn.execute(
+                text(
+                    f"""
+                    UPDATE {table_ref}
+                    SET effective_end = :effective_end,
+                        is_current = 0
+                    WHERE id = :id
+                    """
+                ),
+                {"effective_end": effective_end, "id": row_id},
+            )
+
+        if inserts:
+            conn.execute(table.insert(), inserts)
 
 
 def main() -> None:
