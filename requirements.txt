@@ -1,0 +1,8 @@
+pandas
+openpyxl
+SQLAlchemy
+
+# Needed only for --target sqlserver (real AWS SQL Server loads).
+# Also requires the "ODBC Driver 18 for SQL Server" installed on the machine
+# running this script: https://learn.microsoft.com/sql/connect/odbc/download-odbc-driver-for-sql-server
+pyodbc
