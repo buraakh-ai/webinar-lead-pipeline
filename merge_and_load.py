@@ -1,25 +1,29 @@
 """
 Pulls lead data out of the Zoom registration export and the Bitrix CRM
-export, reduces each to the 5 columns the destination table cares about,
-merges + de-dupes them, and loads the result into a SQL Server table.
+export, normalizes each source into a common lead shape, and stores every
+row in the destination table with source metadata so downstream apps can
+trace the lead back to its original source (for example, Zoho campaigns).
 
-Destination schema (5 columns):
-    first_name, last_name, email, phone, comment
+This version intentionally does not implement SCD-2 versioning. Instead,
+when the Bitrix/Zoom API jobs are wired up later, each source feed will
+write directly into RDS as its own source stream/folder, and the
+destination row will retain source metadata such as source_id,
+source_name, and source_type.
 
-The real exports are far wider than 5 columns (Bitrix's is ~164 columns)
-and can carry a few metadata/title rows above the real header row, so
-loading is defensive about both: _read_source_table() scans the first few
-rows of the file to find the one that actually looks like a header before
-reading the table, and _resolve_columns() maps destination fields to source
-columns by exact header match first (falling back to substring match only
-if nothing matches exactly) so it doesn't get fooled by look-alike columns
-(e.g. Bitrix has "Comment" *and* "Instagram comments"; "First Name" *and*
-"Shareholder 1 First Name").
+The real exports are far wider than the core business columns (Bitrix's is
+~164 columns) and can carry a few metadata/title rows above the real
+header row, so loading is defensive about both: _read_source_table()
+scans the first few rows of the file to find the one that actually looks
+like a header before reading the table, and _resolve_columns() maps
+destination fields to source columns by exact header match first
+(falling back to substring match only if nothing matches exactly) so it
+doesn't get fooled by look-alike columns (e.g. Bitrix has "Comment" *and*
+"Instagram comments"; "First Name" *and* "Shareholder 1 First Name").
 
 Today the sources are the two sample .csv files in sample_data/. Later,
 swap load_zoom_registrations()/load_bitrix_contacts() for API calls (Zoom
-API, Bitrix24 REST API) -- everything downstream (normalize/merge/load)
-stays the same.
+API, Bitrix24 REST API) -- everything downstream (normalize, attach
+source metadata, load) stays the same.
 
 Usage:
     # Dry run against a local SQLite file (default -- no AWS creds needed):
@@ -192,7 +196,12 @@ def normalize_name(value: object) -> str | None:
     return name or None
 
 
-def _standardize(df: pd.DataFrame, hints: dict[str, list[str]], source_system: str) -> pd.DataFrame:
+def _standardize(
+    df: pd.DataFrame,
+    hints: dict[str, list[str]],
+    source_name: str,
+    source_type: str,
+) -> pd.DataFrame:
     col_map = _resolve_columns(list(df.columns), hints)
     out = pd.DataFrame(
         {
@@ -203,7 +212,9 @@ def _standardize(df: pd.DataFrame, hints: dict[str, list[str]], source_system: s
             "comment": df[col_map["comment"]].map(normalize_name),
         }
     )
-    out["source_system"] = source_system
+    out["source_id"] = [f"{source_name}:{idx}" for idx in range(len(out))]
+    out["source_name"] = source_name
+    out["source_type"] = source_type
     return out
 
 
@@ -212,14 +223,14 @@ def load_zoom_registrations(path: Path = ZOOM_FILE) -> pd.DataFrame:
     API (e.g. GET /webinars/{id}/registrants) once that's wired up --
     just return a DataFrame with the same raw column names this reads today."""
     raw = _read_source_table(path, header_hint_words=["first name", "last name", "email"])
-    return _standardize(raw, ZOOM_COLUMN_HINTS, source_system="zoom")
+    return _standardize(raw, ZOOM_COLUMN_HINTS, source_name="zoom", source_type="webinar_registration")
 
 
 def load_bitrix_contacts(path: Path = BITRIX_FILE) -> pd.DataFrame:
     """Reads the Bitrix CRM export. Replace with a call to the Bitrix24 REST
     API (e.g. crm.contact.list) once that's wired up."""
     raw = _read_source_table(path, header_hint_words=["first name", "last name", "work e-mail"])
-    return _standardize(raw, BITRIX_COLUMN_HINTS, source_system="bitrix")
+    return _standardize(raw, BITRIX_COLUMN_HINTS, source_name="bitrix", source_type="contact")
 
 
 # Similarity ratio (difflib SequenceMatcher, 0-1) above which two leads'
@@ -360,245 +371,88 @@ def get_engine(target: str) -> Engine:
     return create_engine(f"sqlite:///{db_path}")
 
 
-def _ensure_scd2_columns(engine: Engine, table_name: str) -> None:
-    """Adds the SCD-2 monitoring columns to the destination table.
+def _ensure_sqlite_destination_columns(engine: Engine, table_name: str) -> None:
+    """Adds any missing source-aware columns to an existing SQLite table.
 
-    Existing rows are backfilled as current version 1 so a later re-run can
-    close the prior version and insert a new one only when the data changed.
+    This keeps reruns working when the local SQLite file was created before
+    the source metadata columns were introduced.
     """
-    metadata = MetaData()
-    table = Table(
-        table_name,
-        metadata,
-        Column("id", Integer, primary_key=True, autoincrement=True),
-        Column("first_name", Unicode(100)),
-        Column("last_name", Unicode(100)),
-        Column("email", Unicode(255)),
-        Column("phone", Unicode(30)),
-        Column("comment", UnicodeText),
-        Column("loaded_at", DateTime, nullable=False, server_default=func.now()),
-        Column("effective_start", DateTime),
-        Column("effective_end", DateTime),
-        Column("is_current", Integer),
-        Column("version", Integer),
-    )
-    table.create(bind=engine, checkfirst=True)
-
-    if engine.dialect.name == "sqlite":
-        with engine.begin() as conn:
-            existing_columns = {
-                row[1]
-                for row in conn.execute(text(f"PRAGMA table_info({table_name})")).fetchall()
-            }
-
-            for column_name, column_sql in (
-                ("effective_start", "DATETIME"),
-                ("effective_end", "DATETIME"),
-                ("is_current", "INTEGER"),
-                ("version", "INTEGER"),
-            ):
-                if column_name not in existing_columns:
-                    conn.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_sql}"))
-
-            conn.execute(
-                text(
-                    f"""
-                    UPDATE {table_name}
-                    SET
-                        effective_start = COALESCE(effective_start, loaded_at),
-                        effective_end = NULL,
-                        is_current = COALESCE(is_current, 1),
-                        version = COALESCE(version, 1)
-                    WHERE effective_start IS NULL OR is_current IS NULL OR version IS NULL
-                    """
-                )
-            )
+    if engine.dialect.name != "sqlite":
         return
 
     with engine.begin() as conn:
         existing_columns = {
-            row[0]
-            for row in conn.execute(
-                text(
-                    f"""
-                    SELECT c.name
-                    FROM sys.columns c
-                    INNER JOIN sys.tables t ON c.object_id = t.object_id
-                    WHERE t.name = '{table_name}'
-                    """
-                )
-            ).fetchall()
+            row[1]
+            for row in conn.execute(text(f"PRAGMA table_info({table_name})")).fetchall()
         }
 
         for column_name, column_sql in (
-            ("effective_start", "DATETIME2(0) NULL"),
-            ("effective_end", "DATETIME2(0) NULL"),
-            ("is_current", "INT NULL"),
-            ("version", "INT NULL"),
+            ("source_id", "TEXT"),
+            ("source_name", "TEXT"),
+            ("source_type", "TEXT"),
         ):
             if column_name not in existing_columns:
-                conn.execute(
-                    text(
-                        f"ALTER TABLE dbo.{table_name} ADD {column_name} {column_sql}"
-                    )
-                )
-
-        conn.execute(
-            text(
-                f"""
-                UPDATE dbo.{table_name}
-                SET
-                    effective_start = COALESCE(effective_start, loaded_at),
-                    effective_end = NULL,
-                    is_current = COALESCE(is_current, 1),
-                    version = COALESCE(version, 1)
-                WHERE effective_start IS NULL OR is_current IS NULL OR version IS NULL
-                """
-            )
-        )
+                conn.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_sql}"))
 
 
-def _row_signature(row: dict[str, object]) -> dict[str, object]:
-    return {
-        "first_name": None if pd.isna(row.get("first_name")) else str(row["first_name"]).strip(),
-        "last_name": None if pd.isna(row.get("last_name")) else str(row["last_name"]).strip(),
-        "email": None if pd.isna(row.get("email")) else str(row["email"]).strip().lower(),
-        "phone": None if pd.isna(row.get("phone")) else str(row["phone"]).strip(),
-        "comment": None if pd.isna(row.get("comment")) else str(row["comment"]).strip(),
-    }
+def _create_destination_table(engine: Engine, table_name: str):
+    """Creates the destination table without SCD-2 history tracking.
 
-
-def _current_match(existing_rows: pd.DataFrame, row: dict[str, object]) -> pd.Series | None:
-    if not isinstance(existing_rows, pd.DataFrame) or existing_rows.empty:
-        return None
-
-    signature = _row_signature(row)
-
-    if signature["email"]:
-        matches = existing_rows[
-            (existing_rows["email"].fillna("").str.lower() == signature["email"])
-            & (existing_rows["is_current"].fillna(1) == 1)
-        ]
-    else:
-        matches = existing_rows[
-            (existing_rows["phone"].fillna("") == (signature["phone"] or ""))
-            & (existing_rows["is_current"].fillna(1) == 1)
-        ]
-
-    if matches.empty:
-        return None
-
-    return matches.iloc[0]
-
-
-def _rows_equal(current_row: pd.Series, incoming_row: dict[str, object]) -> bool:
-    incoming = _row_signature(incoming_row)
-    for field in ("first_name", "last_name", "email", "phone", "comment"):
-        current_value = current_row.get(field)
-        if pd.isna(current_value):
-            current_value = None
-        else:
-            current_value = str(current_value).strip()
-            if field == "email":
-                current_value = current_value.lower()
-        if current_value != incoming[field]:
-            return False
-    return True
-
-
-def push_to_sql_server(df: pd.DataFrame, engine: Engine, table_name: str = DEST_TABLE) -> None:
-    """Creates the destination table if it doesn't exist yet and stores rows
-    using SCD-2 semantics. Existing rows are versioned and updated only when
-    a later load changes the lead's data.
+    Each row carries source metadata so downstream apps can attribute the
+    lead back to the originating system/job stream.
     """
     metadata = MetaData()
     table = Table(
         table_name,
         metadata,
         Column("id", Integer, primary_key=True, autoincrement=True),
+        Column("source_id", Unicode(255)),
+        Column("source_name", Unicode(100), nullable=False),
+        Column("source_type", Unicode(100)),
         Column("first_name", Unicode(100)),
         Column("last_name", Unicode(100)),
         Column("email", Unicode(255)),
         Column("phone", Unicode(30)),
         Column("comment", UnicodeText),
         Column("loaded_at", DateTime, nullable=False, server_default=func.now()),
-        Column("effective_start", DateTime),
-        Column("effective_end", DateTime),
-        Column("is_current", Integer),
-        Column("version", Integer),
     )
     metadata.create_all(engine)
-    _ensure_scd2_columns(engine, table_name)
+    _ensure_sqlite_destination_columns(engine, table_name)
+    return table
 
-    table_ref = f"dbo.{table_name}" if engine.dialect.name == "mssql" else table_name
-    existing_rows = pd.read_sql(
-        f"SELECT * FROM {table_ref} WHERE is_current = 1 OR is_current IS NULL",
-        engine,
-    )
 
-    payload = df[["first_name", "last_name", "email", "phone", "comment"]].to_dict(orient="records")
+def push_to_sql_server(df: pd.DataFrame, engine: Engine, table_name: str = DEST_TABLE) -> None:
+    """Creates the destination table if it doesn't exist yet and stores rows
+    directly with source metadata. This intentionally avoids SCD-2 history
+    tracking in favor of simple, source-aware records that can be used by
+    Zoho or other downstream campaign systems.
+    """
+    table = _create_destination_table(engine, table_name)
+
+    payload = df[
+        ["source_id", "source_name", "source_type", "first_name", "last_name", "email", "phone", "comment"]
+    ].to_dict(orient="records")
     now = datetime.now(timezone.utc)
 
-    updates: list[tuple[int, datetime]] = []
-    inserts: list[dict[str, object]] = []
-
+    rows: list[dict[str, object]] = []
     for row in payload:
-        row_copy = dict(row)
-        existing_match = _current_match(existing_rows, row_copy)
-
-        if existing_match is None:
-            inserts.append(
-                {
-                    "first_name": row_copy.get("first_name"),
-                    "last_name": row_copy.get("last_name"),
-                    "email": row_copy.get("email"),
-                    "phone": row_copy.get("phone"),
-                    "comment": row_copy.get("comment"),
-                    "loaded_at": now,
-                    "effective_start": now,
-                    "effective_end": None,
-                    "is_current": 1,
-                    "version": 1,
-                }
-            )
-            continue
-
-        if _rows_equal(existing_match, row_copy):
-            continue
-
-        updates.append((int(existing_match["id"]), now))
-        version = int(existing_match["version"] or 1) + 1
-        inserts.append(
+        rows.append(
             {
-                "first_name": row_copy.get("first_name"),
-                "last_name": row_copy.get("last_name"),
-                "email": row_copy.get("email"),
-                "phone": row_copy.get("phone"),
-                "comment": row_copy.get("comment"),
+                "source_id": row.get("source_id"),
+                "source_name": row.get("source_name"),
+                "source_type": row.get("source_type"),
+                "first_name": row.get("first_name"),
+                "last_name": row.get("last_name"),
+                "email": row.get("email"),
+                "phone": row.get("phone"),
+                "comment": row.get("comment"),
                 "loaded_at": now,
-                "effective_start": now,
-                "effective_end": None,
-                "is_current": 1,
-                "version": version,
             }
         )
 
-    with engine.begin() as conn:
-        for row_id, effective_end in updates:
-            conn.execute(
-                text(
-                    f"""
-                    UPDATE {table_ref}
-                    SET effective_end = :effective_end,
-                        is_current = 0
-                    WHERE id = :id
-                    """
-                ),
-                {"effective_end": effective_end, "id": row_id},
-            )
-
-        if inserts:
-            conn.execute(table.insert(), inserts)
+    if rows:
+        with engine.begin() as conn:
+            conn.execute(table.insert(), rows)
 
 
 def main() -> None:
@@ -614,17 +468,26 @@ def main() -> None:
 
     zoom_df = load_zoom_registrations()
     bitrix_df = load_bitrix_contacts()
-    merged_df = merge_sources(zoom_df, bitrix_df)
+
+    source_feeds = {
+        "zoom": zoom_df,
+        "bitrix": bitrix_df,
+    }
 
     print(f"Zoom rows:   {len(zoom_df)}")
     print(f"Bitrix rows: {len(bitrix_df)}")
-    print(f"Merged rows (after de-dupe): {len(merged_df)}\n")
-    print(merged_df.to_string(index=False))
+    print("\nSource feeds to load into RDS:")
+    for source_name, frame in source_feeds.items():
+        print(f"- {source_name}: {len(frame)} rows")
 
     engine = get_engine(args.target)
-    push_to_sql_server(merged_df, engine)
 
-    print(f"\nLoaded {len(merged_df)} rows into '{DEST_TABLE}' on target={args.target}")
+    for source_name, frame in source_feeds.items():
+        print(f"\nLoading {len(frame)} rows from source '{source_name}' into '{DEST_TABLE}'...")
+        print(frame.to_string(index=False))
+        push_to_sql_server(frame, engine)
+
+    print(f"\nLoaded {len(zoom_df) + len(bitrix_df)} rows into '{DEST_TABLE}' on target={args.target}")
     if args.target == "local":
         print(f"Local test DB: {BASE_DIR / 'test_output.db'}")
 

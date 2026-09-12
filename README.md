@@ -1,8 +1,8 @@
 # Webinar Lead Pipeline
 
-Merges webinar/lead data from two separate systems into one destination
-table, so sales has a single, de-duplicated list of leads instead of two
-disconnected exports.
+Loads webinar/lead data from two separate systems into one destination
+table, preserving the source identity for each row so downstream systems
+such as Zoho can attribute campaigns correctly.
 
 ## Why this exists
 
@@ -12,12 +12,11 @@ Leads currently come in from two places that don't talk to each other:
 - **Bitrix** CRM (call/lead export)
 
 Each export has far more columns than needed (Bitrix's real export is
-~164 columns), and the same person can show up in both -- or more than
-once within Bitrix alone (e.g. a call logged twice a minute apart). This
-script pulls just the 5 fields that matter (first name, last name, email,
-phone, comment), merges the two sources, collapses duplicates, and loads
-the result into a destination table that now supports SCD-2-style history
-tracking.
+~164 columns), so this script first normalizes each source down to the
+core lead fields that matter (first name, last name, email, phone,
+comment). The output keeps `source_id`, `source_name`, and `source_type`
+for every row so Zoho or other downstream apps can attribute the record
+back to the original source campaign or feed.
 
 Today the two sources are files (dropped into `sample_data/`); AWS SQL
 Server credentials weren't available yet at the time this was built, so
@@ -28,29 +27,30 @@ anticipates two things changing later without needing a rewrite:
 1. **Files -> APIs.** `load_zoom_registrations()` / `load_bitrix_contacts()`
    are the only functions that know about files today; swapping them for
    Zoom API / Bitrix24 REST API calls is a self-contained change --
-   everything downstream (normalize, merge, dedupe, load) just operates on
-   a DataFrame and doesn't care where it came from.
+   everything downstream (normalize, attach source metadata, load) just
+   operates on a DataFrame and doesn't care where it came from.
 2. **SQLite -> AWS SQL Server.** `push_to_sql_server()` already targets
    real SQL Server via `--target sqlserver` once `AWS_SQL_*` credentials
    are set (see `.env.example`); it just hasn't been run against a live
    instance yet.
 
-## How leads get merged
+## How the source feeds are normalized
 
-A lead from one source is treated as the same lead as one from the other
-if, in order:
+Each source export is read independently and normalized into the same
+common lead layout:
 
-1. they share the same **email**, or
-2. they share the same **phone number**, or
-3. neither of the above matched, but their **names are a close fuzzy
-   match** (handles the same person being logged with a work
-   email/phone in one system and a personal one in the other, and/or
-   their name typed slightly differently by whoever entered it)
+- `first_name`
+- `last_name`
+- `email`
+- `phone`
+- `comment`
+- `source_id`
+- `source_name`
+- `source_type`
 
-Each merged row keeps a `match_reason` (`email`, `phone`, `email+phone`,
-`fuzzy_name`, or `unique`) during processing so it's auditable *why* two
-records were merged -- this is dropped before the row is written to the
-destination table, since it's not one of the 5 business columns.
+The `source_id`, `source_name`, and `source_type` fields are the key
+addition for the Zoho campaign use case: they tell downstream apps which
+source feed generated each row and which campaign or folder it came from.
 
 Column matching against the source files (`_resolve_columns()` in
 `merge_and_load.py`) is exact-match-first, not loose substring matching --
@@ -66,27 +66,26 @@ like a header.
 See [schema.sql](schema.sql) for the full DDL and reasoning (e.g. why
 `comment` is `NVARCHAR(MAX)` and not a short `VARCHAR`). Summary:
 
-| column           | type            | notes                                                    |
-|------------------|-----------------|-----------------------------------------------------------|
-| `id`             | `INT IDENTITY`  | surrogate key, not one of the 5 fields                   |
-| `first_name`     | `NVARCHAR(100)` |                                                           |
-| `last_name`      | `NVARCHAR(100)` |                                                           |
-| `email`          | `NVARCHAR(255)` |                                                           |
-| `phone`          | `NVARCHAR(30)`  | digits only, no formatting                               |
-| `comment`        | `NVARCHAR(MAX)` | full free-text note(s)                                   |
-| `loaded_at`      | `DATETIME2`     | audit timestamp, not one of the 5                        |
-| `effective_start`| `DATETIME2`     | when this version became current                        |
-| `effective_end`  | `DATETIME2`     | when this version stopped being current                  |
-| `is_current`     | `INT`           | `1` for the active version, `0` for historical versions  |
-| `version`        | `INT`           | monotonically increasing version number for a lead       |
+| column         | type            | notes                                                      |
+|----------------|-----------------|-------------------------------------------------------------|
+| `id`           | `INT IDENTITY`  | surrogate key                                              |
+| `source_id`    | `NVARCHAR(255)` | unique source record identifier, used by Zoho campaign apps |
+| `source_name`  | `NVARCHAR(100)` | source system name (`bitrix`, `zoom`)                     |
+| `source_type`  | `NVARCHAR(100)` | source feed type (`contact`, `webinar_registration`)       |
+| `first_name`   | `NVARCHAR(100)` |                                                             |
+| `last_name`    | `NVARCHAR(100)` |                                                             |
+| `email`        | `NVARCHAR(255)` |                                                             |
+| `phone`        | `NVARCHAR(30)`  | digits only, no formatting                                 |
+| `comment`      | `NVARCHAR(MAX)` | full free-text note(s)                                     |
+| `loaded_at`    | `DATETIME2`     | audit timestamp                                            |
 
 `merge_and_load.py` creates this table automatically on first run if it
 doesn't exist yet (matching `schema.sql`).
 
-In the current first phase, the loader keeps the destination idempotent for
-unchanged input and creates a new version when the lead's data changes.
-This is an SCD-2-style history model, but it is intentionally lightweight
-and meant to evolve as the project grows.
+This version intentionally does not implement SCD-2 history tracking. Each
+source feed can be pushed directly into the destination table with its own
+`source_id`, `source_name`, and `source_type`, which makes the table a
+clean source for Zoho campaigns and similar downstream consumers.
 
 ## Running it
 
@@ -96,8 +95,8 @@ pip install -r requirements.txt
 # (Re)build the sample data files from the real exports in sample_data/raw/
 python scripts/generate_sample_data.py
 
-# Dry run -- merges the sample files and loads into a local SQLite file
-# (test_output.db), no AWS access needed. Prints the merged data and a
+# Dry run -- loads the sample source feeds into a local SQLite file
+# (test_output.db), no AWS access needed. Prints the source rows and a
 # read-back from the destination table.
 python merge_and_load.py
 
@@ -111,18 +110,17 @@ python merge_and_load.py --target sqlserver
 - **Not tested against real AWS SQL Server** -- no credentials were
   available yet when this was built. `--target sqlserver` is wired up but
   unverified against a live instance (network access, ODBC driver, auth).
-- **This is only the first phase of SCD-2** -- the current loader keeps
-  history by versioning rows, but it does not yet add a full business-key
-  model, row-level provenance beyond `loaded_at`, or a more formal
-  historical query layer.
 - **No API integration yet** -- still reads local files, not the Zoom/
   Bitrix24 APIs.
 - **No scheduling/orchestration** -- nothing runs this automatically yet.
+- **No downstream Zoho app wiring yet** -- the destination table is now
+  ready to be used as the source for Zoho campaign ingestion, but that
+  integration is still future work.
 
 ## Layout
 
 ```
-merge_and_load.py            the pipeline: load -> merge/dedupe -> load to SQL
+merge_and_load.py            the pipeline: load -> normalize -> load to SQL
 schema.sql                   destination table DDL (SQL Server)
 requirements.txt
 .env.example                 AWS SQL Server connection env vars (copy to .env)
